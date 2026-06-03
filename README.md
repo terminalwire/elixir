@@ -1,15 +1,33 @@
 # Terminalwire (Elixir)
 
-Terminalwire v2 server for Elixir — the layer **between your WebSocket endpoint
-(Phoenix / Bandit / Plug.Cowboy) and your CLI / terminal code**. Stream a
-command-line app from your server to the Terminalwire client over a single
-WebSocket, with no web API.
+**Ship a CLI for your web app. No API required.**
+
+Terminalwire streams a command-line app straight from your Phoenix/Plug server to
+your users' machines over a single WebSocket. Instead of building an API,
+generating an SDK, and shipping a separate client, you write your CLI *in your
+app* — calling your contexts, Ecto, and business logic directly — and it runs on
+the user's workstation with their terminal, files, and browser.
 
 ```
  Terminalwire client ⇄ WebSocket endpoint ⇄ Terminalwire.WebSock
                                             ⇄ Server.Session (protocol)
                                             ⇄ Server.Context ⇄ your CLI handler
 ```
+
+## Why this is nice
+
+- **No API to build or version.** Your CLI calls your app's code directly — no
+  serializers, no SDK, no client/server version skew.
+- **It feels local.** Output streams in real time, prompts and passwords work,
+  it's color/TTY-aware, resizes with the window, `Ctrl-C` interrupts the
+  server-side command, and you can pipe into it (`cat data.csv | your-app import`).
+- **Secure by construction.** The client is the trust boundary: the server
+  *requests* access to a file/env var/the browser and the client enforces a
+  per-app entitlement policy. Your server never touches the user's machine.
+- **One BEAM process per session.** Each connection is a supervised process; the
+  CLI handler runs in its own task. Natural fit for Phoenix.
+- **Same protocol, any client.** This server speaks the exact wire protocol the
+  Go client and the Ruby server do — proven by a shared conformance corpus.
 
 ## Install
 
