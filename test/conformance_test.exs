@@ -8,10 +8,16 @@ defmodule Terminalwire.ConformanceTest do
   """
   use ExUnit.Case
 
-  alias Terminalwire.{Codec, Negotiator}
+  alias Terminalwire.{Codec, Negotiator, Window}
 
   @corpus System.get_env("TERMINALWIRE_CORPUS") ||
             Path.expand("../../../conformance", __DIR__)
+
+  # Every category the corpus ships. The completeness gate below fails the build
+  # if this list ever drifts from what the corpus actually contains OR from what
+  # this suite exercises — so an implementation can't silently skip a category
+  # (which is exactly how this suite previously ran only 3 of 5).
+  @covered_categories ~w(negotiate roundtrip golden validate flow)
 
   defp load(category) do
     Path.wildcard(Path.join([@corpus, "vectors", category, "*.yml"]))
@@ -101,6 +107,74 @@ defmodule Terminalwire.ConformanceTest do
         bytes = hex_to_bytes(v["bytes_hex"])
         assert_raise Terminalwire.ProtocolError, fn -> Codec.decode(bytes) end
       end
+    end
+  end
+
+  describe "roundtrip corpus (decode . encode == identity)" do
+    test "every frame round-trips" do
+      vectors = load("roundtrip")
+      assert length(vectors) > 0, "roundtrip corpus is empty — wrong corpus path?"
+
+      for v <- vectors do
+        frame = normalize(resolve_bin(v["frame"]))
+        assert normalize(Codec.decode(Codec.encode(frame))) == frame,
+               "roundtrip/#{v["name"]}"
+      end
+    end
+  end
+
+  describe "flow corpus (credit accounting)" do
+    test "every flow vector accounts identically + never overflows" do
+      vectors = load("flow")
+      assert length(vectors) > 0, "flow corpus is empty — wrong corpus path?"
+
+      for v <- vectors do
+        initial = v["window"]
+
+        {window, _granted, _taken} =
+          Enum.reduce(v["ops"], {Window.new(initial), 0, 0}, fn op, {w, granted, taken} ->
+            {w, granted} =
+              if Map.has_key?(op, "grant"),
+                do: {Window.grant(w, op["grant"]), granted + op["grant"]},
+                else: {w, granted}
+
+            if Map.has_key?(op, "take") do
+              {got, w} = Window.take(w, op["take"])
+              assert got == op["got"], "flow/#{v["name"]}: take(#{op["take"]}) = #{got}, want #{op["got"]}"
+              taken = taken + got
+              assert taken <= initial + granted, "flow/#{v["name"]}: overflow"
+              {w, granted, taken}
+            else
+              {w, granted, taken}
+            end
+          end)
+
+        assert Window.available(window) == v["final_available"], "flow/#{v["name"]} final"
+      end
+    end
+  end
+
+  # Completeness gate: assert this suite exercises EVERY category the corpus
+  # ships — no silent drift. If the corpus gains a category, this fails until the
+  # implementation adds a runner for it.
+  describe "corpus completeness" do
+    test "this implementation exercises every corpus category" do
+      on_disk =
+        Path.wildcard(Path.join([@corpus, "vectors", "*"]))
+        |> Enum.filter(&File.dir?/1)
+        |> Enum.map(&Path.basename/1)
+        |> MapSet.new()
+
+      covered = MapSet.new(@covered_categories)
+
+      missing = MapSet.difference(on_disk, covered)
+      stale = MapSet.difference(covered, on_disk)
+
+      assert MapSet.size(missing) == 0,
+             "corpus categories NOT exercised by this implementation: #{inspect(MapSet.to_list(missing))}"
+
+      assert MapSet.size(stale) == 0,
+             "categories claimed-covered but absent from corpus: #{inspect(MapSet.to_list(stale))}"
     end
   end
 
