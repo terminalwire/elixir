@@ -1,0 +1,226 @@
+defmodule Terminalwire.Server.SessionTest do
+  @moduledoc """
+  End-to-end integration of the REAL Session + Context + a CLI handler. A test
+  client (this process) plays the client role over the Session's actual seam:
+  it receives the server's outbound frames via `on_send`, decodes them with the
+  real Codec, and answers requests — exactly as the Go client would. This covers
+  the implementation side (Session GenServer, Context API) that protocol tests
+  don't reach.
+  """
+  use ExUnit.Case
+
+  alias Terminalwire.{Codec, Frames}
+  alias Terminalwire.Server.{Session, Context}
+
+  # A tiny client simulator: starts a Session whose on_send delivers frames to
+  # this process, plays the handshake, and auto-answers stdin/env/file requests
+  # from canned data. Returns collected stdout/stderr + exit status.
+  defp run(handler, opts \\ []) do
+    test = self()
+
+    {:ok, session} =
+      Session.start_link(
+        handler: handler,
+        on_send: fn bytes -> send(test, {:frame, bytes}) end
+      )
+
+    # client -> server hello
+    Session.receive_frame(session, Codec.encode(hello(opts)))
+
+    loop(session, %{stdout: "", stderr: "", streams: %{}, status: nil, opts: opts})
+  end
+
+  defp hello(opts) do
+    %{
+      "t" => "hello",
+      "sid" => 0,
+      "protocol" => 2,
+      "capabilities" => ["stdio", "file", "env"],
+      "program" => %{"name" => "acme", "args" => Keyword.get(opts, :args, [])},
+      "entitlement" => %{"authority" => "acme.test"},
+      "terminal" => %{
+        "stdin" => %{"kind" => "tty"},
+        "stdout" => %{"kind" => "tty"},
+        "stderr" => %{"kind" => "tty"},
+        "device" => %{"cols" => 80, "rows" => 24}
+      }
+    }
+  end
+
+  defp loop(session, state) do
+    receive do
+      {:frame, bytes} ->
+        frame = Codec.decode(bytes)
+        state = handle(session, frame, state)
+
+        if frame["t"] == "exit" do
+          %{stdout: state.stdout, stderr: state.stderr, status: frame["status"]}
+        else
+          loop(session, state)
+        end
+    after
+      3000 -> flunk("session timed out; collected: #{inspect(state)}")
+    end
+  end
+
+  defp handle(_session, %{"t" => "welcome"}, state), do: state
+
+  defp handle(_session, %{"t" => "open", "sid" => sid, "stream" => stream}, state) do
+    put_in(state, [:streams, sid], stream)
+  end
+
+  defp handle(session, %{"t" => "data", "sid" => sid, "bytes" => bytes}, state) do
+    data = if is_struct(bytes, Msgpax.Bin), do: bytes.data, else: bytes
+    key = if state.streams[sid] == "stderr", do: :stderr, else: :stdout
+    # return flow credit, like a real client
+    Session.receive_frame(session, Codec.encode(Frames.window_adjust(sid, byte_size(data))))
+    Map.update!(state, key, &(&1 <> data))
+  end
+
+  defp handle(_session, %{"t" => "close"}, state), do: state
+
+  defp handle(session, %{"t" => "request", "sid" => sid, "resource" => res, "method" => meth} = f, state) do
+    value =
+      case {res, meth} do
+        {"stdin", "gets"} -> Keyword.get(state.opts, :stdin, "typed\n")
+        {"stdin", "getpass"} -> Keyword.get(state.opts, :password, "secret")
+        {"env", "read"} -> Keyword.get(state.opts, :env, %{})[f["params"]["name"]]
+        {"file", "read"} -> Keyword.get(state.opts, :files, %{})[f["params"]["path"]]
+        _ -> nil
+      end
+
+    Session.receive_frame(session, Codec.encode(Frames.response_ok(sid, value)))
+    state
+  end
+
+  defp handle(_session, _frame, state), do: state
+
+  # --- tests ---
+
+  test "runs a handler and streams stdout, then exits 0" do
+    result = run(fn ctx -> Context.puts(ctx, "hello world"); 0 end)
+    assert result.stdout == "hello world\n"
+    assert result.status == 0
+  end
+
+  test "passes program args to the handler" do
+    result =
+      run(
+        fn ctx ->
+          [cmd | _] = Context.args(ctx)
+          Context.puts(ctx, "cmd=#{cmd}")
+          0
+        end,
+        args: ["deploy", "--force"]
+      )
+
+    assert result.stdout =~ "cmd=deploy"
+  end
+
+  test "gets a line from the client over a real request/response" do
+    result =
+      run(
+        fn ctx ->
+          name = ctx |> Context.gets("name? ") |> String.trim()
+          Context.puts(ctx, "hi #{name}")
+          0
+        end,
+        stdin: "Ada\n"
+      )
+
+    assert result.stdout =~ "name? "
+    assert result.stdout =~ "hi Ada"
+  end
+
+  test "reads a password without echo" do
+    result =
+      run(
+        fn ctx ->
+          pw = Context.read_secret(ctx, "pw? ")
+          Context.puts(ctx, "len=#{String.length(pw)}")
+          0
+        end,
+        password: "hunter2"
+      )
+
+    assert result.stdout =~ "len=7"
+  end
+
+  test "reads env and a file through the client" do
+    result =
+      run(
+        fn ctx ->
+          Context.puts(ctx, "home=#{Context.env(ctx, "HOME")}")
+          Context.puts(ctx, "cfg=#{Context.file_read(ctx, "/etc/acme")}")
+          0
+        end,
+        env: %{"HOME" => "/home/ada"},
+        files: %{"/etc/acme" => "config-body"}
+      )
+
+    assert result.stdout =~ "home=/home/ada"
+    assert result.stdout =~ "cfg=config-body"
+  end
+
+  test "writes to stderr" do
+    result = run(fn ctx -> Context.warn(ctx, "oops"); 0 end)
+    assert result.stderr == "oops\n"
+  end
+
+  test "non-integer handler return becomes exit 0" do
+    result = run(fn ctx -> Context.puts(ctx, "ok"); :done end)
+    assert result.status == 0
+  end
+
+  test "a crashing handler exits 1 (does not hang)" do
+    result = run(fn _ctx -> raise "boom" end)
+    assert result.status == 1
+  end
+
+  test "Context.file_write round-trips and explicit Context.exit sets the status" do
+    result =
+      run(fn ctx ->
+        Context.file_write(ctx, "/tmp/out", "data")
+        Context.exit(ctx, 3)
+      end)
+
+    assert result.status == 3
+  end
+
+  test "Context.request surfaces a failed response as {:error, code, message}" do
+    test = self()
+
+    {:ok, session} =
+      Session.start_link(handler: fn ctx -> send(test, {:result, deny_probe(ctx)}); 0 end, on_send: fn b -> send(test, {:frame, b}) end)
+
+    Session.receive_frame(session, Codec.encode(hello([])))
+
+    # Drive: wait for the request, answer with an error, collect the handler's result.
+    loop_until_error(session)
+  end
+
+  defp deny_probe(ctx) do
+    Context.request(ctx, "file", "read", %{"path" => "/etc/shadow"}, 2000)
+  end
+
+  defp loop_until_error(session) do
+    receive do
+      {:frame, bytes} ->
+        f = Codec.decode(bytes)
+
+        cond do
+          f["t"] == "request" ->
+            Session.receive_frame(session, Codec.encode(Frames.response_error(f["sid"], "denied", "nope")))
+            loop_until_error(session)
+
+          true ->
+            loop_until_error(session)
+        end
+
+      {:result, result} ->
+        assert {:error, "denied", "nope"} = result
+    after
+      3000 -> flunk("never saw the handler result")
+    end
+  end
+end

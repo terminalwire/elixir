@@ -15,7 +15,10 @@ defmodule Terminalwire.MixProject do
       package: package(),
       name: "Terminalwire",
       source_url: @source_url,
-      docs: [main: "readme", extras: ["README.md"]]
+      docs: [main: "readme", extras: ["README.md"]],
+      # `mix test --cover` fails the build if total coverage drops below this
+      # floor. Raise it as coverage improves; never lower it silently.
+      test_coverage: [summary: [threshold: 85]]
     ]
   end
 
