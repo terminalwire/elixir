@@ -38,6 +38,13 @@ defmodule Terminalwire.Server.Context do
   def args(%__MODULE__{program: %{"args" => args}}), do: args
   def args(_), do: []
 
+  @doc """
+  The client's terminal as a `Terminalwire.Server.Terminal` struct
+  (`cols`, `rows`, `tty?`, …), so server code can do `Context.terminal(ctx).cols`
+  instead of digging through the raw handshake map.
+  """
+  def terminal(%__MODULE__{terminal: t}), do: Terminalwire.Server.Terminal.from_map(t)
+
   # --- output (one-way) ---
 
   def print(%__MODULE__{} = ctx, data),
