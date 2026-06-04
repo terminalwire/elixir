@@ -85,7 +85,13 @@ defmodule Terminalwire.Server.SessionTest do
         {"stdin", "gets"} -> Keyword.get(state.opts, :stdin, "typed\n")
         {"stdin", "getpass"} -> Keyword.get(state.opts, :password, "secret")
         {"env", "read"} -> Keyword.get(state.opts, :env, %{})[f["params"]["name"]]
-        {"file", "read"} -> Keyword.get(state.opts, :files, %{})[f["params"]["path"]]
+        # Real clients return file bytes as msgpack `bin` (Msgpax.Bin) — mimic
+        # that so the Context must unwrap it to a plain binary for callers.
+        {"file", "read"} ->
+          case Keyword.get(state.opts, :files, %{})[f["params"]["path"]] do
+            nil -> nil
+            body -> Msgpax.Bin.new(body)
+          end
         _ -> nil
       end
 
@@ -159,6 +165,8 @@ defmodule Terminalwire.Server.SessionTest do
       )
 
     assert result.stdout =~ "home=/home/ada"
+    # Regression: file.read comes back as msgpack bin (Msgpax.Bin); Context must
+    # unwrap it to a plain binary so string interpolation works (was a crash).
     assert result.stdout =~ "cfg=config-body"
   end
 

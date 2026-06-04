@@ -82,8 +82,18 @@ defmodule Terminalwire.Server.Context do
 
   defp request!(ctx, resource, method, params) do
     case request(ctx, resource, method, params) do
-      {:ok, value} -> value
+      {:ok, value} -> unwrap(value)
       {:error, code, message} -> raise ResponseError, code: code, message: message
     end
   end
+
+  # A response value may carry binary payloads as Msgpax.Bin (e.g. file.read,
+  # which is encoded as msgpack `bin`). Unwrap to a plain Elixir binary so callers
+  # get a normal string back instead of a struct. Recurse into list/map shapes
+  # (e.g. read_chunk's %{"data" => ..., "eof" => ...}).
+  defp unwrap(%Msgpax.Bin{data: data}), do: data
+  defp unwrap(list) when is_list(list), do: Enum.map(list, &unwrap/1)
+  defp unwrap(map) when is_map(map) and not is_struct(map),
+    do: Map.new(map, fn {k, v} -> {k, unwrap(v)} end)
+  defp unwrap(other), do: other
 end
