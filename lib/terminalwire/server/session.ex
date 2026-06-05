@@ -123,8 +123,45 @@ defmodule Terminalwire.Server.Session do
 
   @impl true
   def handle_cast({:frame, bytes}, state) do
-    {conn, directives} = Connection.receive_frame(state.conn, Codec.decode(bytes))
-    state = %{state | conn: conn}
+    case decode_frame(bytes) do
+      :error -> {:noreply, state}
+      {:ok, frame} -> apply_frame(frame, state)
+    end
+  end
+
+  # Decode bytes. A malformed/undecodable frame is DROPPED (not fatal) — one bad
+  # frame must not tear down the session, matching the Go client and the Ruby pump.
+  defp decode_frame(bytes) do
+    {:ok, Codec.decode(bytes)}
+  rescue
+    e in Terminalwire.ProtocolError ->
+      Logger.warning("terminalwire: dropping malformed frame: #{Exception.message(e)}")
+      :error
+  end
+
+  # Run a decoded frame through the state machine and apply its directives. The two
+  # ProtocolError sources are treated differently, matching the Ruby server + spec:
+  #   * receive_frame raising = a STATE-MACHINE violation (an unexpected frame for
+  #     the current state) -> FATAL, end the session (PROTOCOL.md);
+  #   * a directive raising (e.g. unwrap_bin on a non-binary data 'bytes') = a
+  #     frame-level payload problem -> DROP, like a malformed decode.
+  defp apply_frame(frame, state) do
+    case receive_frame_safe(state.conn, frame) do
+      :violation -> {:stop, :normal, state}
+      {:ok, conn, directives} -> apply_directives_safe(directives, %{state | conn: conn})
+    end
+  end
+
+  defp receive_frame_safe(conn, frame) do
+    {conn, directives} = Connection.receive_frame(conn, frame)
+    {:ok, conn, directives}
+  rescue
+    e in Terminalwire.ProtocolError ->
+      Logger.warning("terminalwire: protocol violation, closing session: #{Exception.message(e)}")
+      :violation
+  end
+
+  defp apply_directives_safe(directives, state) do
     {:noreply, Enum.reduce(directives, state, &apply_directive/2)}
   rescue
     e in Terminalwire.ProtocolError ->

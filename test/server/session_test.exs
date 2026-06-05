@@ -303,6 +303,32 @@ defmodule Terminalwire.Server.SessionTest do
     assert exit_frame["status"] == 130
   end
 
+  # A malformed (undecodable) frame is dropped and the session continues; a
+  # well-formed but UNEXPECTED frame (a state-machine violation) ends the session,
+  # per PROTOCOL.md — and matching the Ruby server. These must not be conflated.
+  test "an unexpected frame after ready ends the session; a malformed one is dropped" do
+    test = self()
+
+    {:ok, session} =
+      Session.start_link(
+        handler: fn _ctx -> Process.sleep(:infinity) end,
+        on_send: fn b -> send(test, {:frame, b}) end
+      )
+
+    ref = Process.monitor(session)
+    Session.receive_frame(session, Codec.encode(hello([])))
+    assert_receive {:frame, w}, 1000
+    assert Codec.decode(w)["t"] == "welcome"
+
+    # Malformed bytes: dropped, session stays up.
+    Session.receive_frame(session, <<0xC1>>)
+    refute_receive {:DOWN, ^ref, :process, ^session, _}, 200
+
+    # A second `hello` is illegal once ready (server-direction violation): fatal.
+    Session.receive_frame(session, Codec.encode(hello([])))
+    assert_receive {:DOWN, ^ref, :process, ^session, :normal}, 1000
+  end
+
   test "non-integer handler return becomes exit 0" do
     result = run(fn ctx -> Context.puts(ctx, "ok"); :done end)
     assert result.status == 0
