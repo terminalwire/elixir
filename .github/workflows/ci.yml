@@ -24,3 +24,16 @@ jobs:
         run: mix deps.get
       - name: Unit tests (corpus excluded without TERMINALWIRE_CORPUS)
         run: mix test
+
+      # Advisory only (never fails the build): surface complexity/refactor smells
+      # so a module doesn't quietly turn gnarly — a "give this a look" signal.
+      - name: Complexity (credo, advisory)
+        if: always()
+        continue-on-error: true
+        run: |
+          {
+            echo "### Elixir complexity (credo --strict, advisory)"
+            echo '```'
+            mix credo --strict 2>&1 | tail -40 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
