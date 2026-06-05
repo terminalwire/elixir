@@ -17,9 +17,10 @@ defmodule Terminalwire.MixProject do
       source_url: @source_url,
       docs: [main: "readme", extras: ["README.md"]],
       # `mix test --cover` fails the build if total coverage drops below this
-      # floor. Set with margin below the actual (~86%) to absorb cross-version
-      # instrumentation variance (CI Elixir vs local). Raise as coverage improves.
-      test_coverage: [summary: [threshold: 80]]
+      # floor. Standalone `mix test` (no corpus) is ~86%; the corpus matrix run is
+      # higher. Margin below the standalone actual absorbs cross-version variance.
+      # Raise as coverage improves; never lower silently.
+      test_coverage: [summary: [threshold: 85]]
     ]
   end
 
