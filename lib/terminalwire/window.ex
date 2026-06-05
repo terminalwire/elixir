@@ -13,7 +13,8 @@ defmodule Terminalwire.Window do
 
   @type t :: %__MODULE__{available: integer()}
 
-  def new(size) when is_integer(size), do: %__MODULE__{available: size}
+  def new(size) when is_integer(size),
+    do: %__MODULE__{available: min(size, Terminalwire.Protocol.max_window())}
 
   def available(%__MODULE__{available: a}), do: a
 
@@ -27,8 +28,11 @@ defmodule Terminalwire.Window do
     {taken, %{w | available: avail - taken}}
   end
 
-  @doc "Extend the window (a window_adjust arrived)."
+  @doc """
+  Extend the window (a window_adjust arrived), clamped to the protocol ceiling
+  (`Terminalwire.Protocol.max_window/0`) so a peer can't grow the window unbounded.
+  """
   def grant(%__MODULE__{available: avail} = w, bytes) when is_integer(bytes) do
-    %{w | available: avail + bytes}
+    %{w | available: min(avail + bytes, Terminalwire.Protocol.max_window())}
   end
 end

@@ -231,6 +231,13 @@ defmodule Terminalwire.Server.Session do
   # abrupt disconnect.
   @impl true
   def terminate(_reason, state) do
+    # Was the handler parked on a deferred reply when we went down? If so, the
+    # replies below wake it and it unwinds cleanly on its own — we must NOT kill it
+    # (a brutal_kill would race the unwind and lose the handler's result).
+    parked? =
+      map_size(state.waiters) > 0 or map_size(state.pending) > 0 or
+        Enum.any?(state.raw, fn {_sid, rs} -> rs.waiter end)
+
     Enum.each(state.waiters, fn {_sid, from} ->
       GenServer.reply(from, {:error, "io", "connection closed"})
     end)
@@ -240,6 +247,15 @@ defmodule Terminalwire.Server.Session do
     end)
 
     Enum.each(state.raw, fn {_sid, rs} -> rs.waiter && GenServer.reply(rs.waiter, nil) end)
+
+    # Kill the handler ONLY if it was not parked. async_nolink monitors but does not
+    # link, so a handler parked in pure compute / Process.sleep / a receive with no
+    # IO (nothing for the replies above to wake) would otherwise outlive the session
+    # as an orphan under the global TaskSupervisor. A parked handler unwinds via the
+    # replies; an already-finished one makes shutdown a no-op.
+    if state.handler_task && not parked?,
+      do: Task.shutdown(state.handler_task, :brutal_kill)
+
     :ok
   end
 
@@ -327,7 +343,13 @@ defmodule Terminalwire.Server.Session do
 
   defp unwrap_bin(%Msgpax.Bin{data: data}), do: data
   defp unwrap_bin(bytes) when is_binary(bytes), do: bytes
-  defp unwrap_bin(other), do: to_string(other)
+  # A data frame's `bytes` must be binary. A non-binary payload (map/int/list from
+  # a malformed or hostile client) used to hit `to_string/1`, which RAISES on a map
+  # (Protocol.UndefinedError) — and that is NOT a ProtocolError, so it escaped the
+  # handle_cast rescue and crashed the whole session. Raise ProtocolError instead so
+  # the malformed frame is dropped like any other (see handle_cast).
+  defp unwrap_bin(_other),
+    do: raise(Terminalwire.ProtocolError, message: "data 'bytes' must be binary")
 
   defp reply_response(from, %{ok: true, value: value}), do: GenServer.reply(from, {:ok, value})
 

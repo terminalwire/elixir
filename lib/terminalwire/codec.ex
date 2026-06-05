@@ -46,7 +46,13 @@ defmodule Terminalwire.Codec do
       raise ProtocolError, message: "frame missing string 't'"
     end
 
-    unless is_integer(Map.get(frame, "sid")) do
+    # 'sid' must be a non-negative integer that fits in a signed 64-bit int. Real
+    # sids are small and server-allocated; the range bound keeps the three impls
+    # aligned (Go decodes sids into int64, so a uint64 > 2^63-1 would wrap to a
+    # negative, colliding sid there — rejecting out-of-range everywhere avoids that).
+    sid = Map.get(frame, "sid")
+
+    unless is_integer(sid) and sid >= 0 and sid <= 0x7FFFFFFFFFFFFFFF do
       raise ProtocolError, message: "frame missing integer 'sid'"
     end
 

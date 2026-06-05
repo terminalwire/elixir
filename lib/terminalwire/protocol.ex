@@ -14,6 +14,12 @@ defmodule Terminalwire.Protocol do
   # The default per-output-stream flow-control window (bytes) a peer offers.
   @default_window 256 * 1024
 
+  # Hard ceiling on a flow window (bytes): the credit ledger clamps to it (see
+  # Window) so a peer can never grow a window past this, no matter what it offers
+  # or grants. Bounds how far a server may run ahead of a slow/hostile client. 64x
+  # the default offer — ample for any terminal stream, far below a memory hazard.
+  @max_window 16 * 1024 * 1024
+
   @capabilities ~w(stdio file directory browser env signal flow raw-input terminal-query)
 
   def version, do: @version
@@ -21,6 +27,7 @@ defmodule Terminalwire.Protocol do
   def max_version, do: @max_version
   def control_sid, do: @control_sid
   def default_window, do: @default_window
+  def max_window, do: @max_window
   def capabilities, do: @capabilities
 
   defmodule Type do
