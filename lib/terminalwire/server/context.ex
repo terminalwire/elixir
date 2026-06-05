@@ -77,6 +77,80 @@ defmodule Terminalwire.Server.Context do
     request!(ctx, "file", "write", %{"path" => to_string(path), "content" => content})
   end
 
+  def file_append(%__MODULE__{} = ctx, path, content) do
+    request!(ctx, "file", "append", %{"path" => to_string(path), "content" => content})
+  end
+
+  def file_delete(%__MODULE__{} = ctx, path),
+    do: request!(ctx, "file", "delete", %{"path" => to_string(path)})
+
+  def file_exists?(%__MODULE__{} = ctx, path),
+    do: request!(ctx, "file", "exist", %{"path" => to_string(path)})
+
+  def dir_list(%__MODULE__{} = ctx, path),
+    do: request!(ctx, "directory", "list", %{"path" => to_string(path)})
+
+  def dir_create(%__MODULE__{} = ctx, path),
+    do: request!(ctx, "directory", "create", %{"path" => to_string(path)})
+
+  def dir_exists?(%__MODULE__{} = ctx, path),
+    do: request!(ctx, "directory", "exist", %{"path" => to_string(path)})
+
+  def dir_delete(%__MODULE__{} = ctx, path),
+    do: request!(ctx, "directory", "delete", %{"path" => to_string(path)})
+
+  def browser_launch(%__MODULE__{} = ctx, url),
+    do: request!(ctx, "browser", "launch", %{"url" => to_string(url)})
+
+  # --- stdin piping (server-pull drain of the client's stdin) ---
+
+  @stdin_chunk 64 * 1024
+
+  @doc "Pull up to `n` bytes from the client's stdin. Returns {data, eof}."
+  def read_chunk(%__MODULE__{} = ctx, n \\ @stdin_chunk) do
+    resp = request!(ctx, "stdin", "read_chunk", %{"n" => n})
+    {resp["data"] || "", resp["eof"]}
+  end
+
+  @doc "Drain the client's stdin to EOF (for piped input)."
+  def read(%__MODULE__{} = ctx), do: drain(ctx, "")
+
+  defp drain(ctx, acc) do
+    {data, eof} = read_chunk(ctx)
+    acc = acc <> data
+    if eof, do: acc, else: drain(ctx, acc)
+  end
+
+  # --- raw input (REPL/TUI keystrokes) ---
+
+  @doc """
+  Read keystrokes for the duration of `fun`: the client puts its terminal in
+  `mode` (`"raw"` or `"cbreak"`) and streams keypresses, restoring it when the
+  block exits. `fun` receives a 0-arity reader returning the next chunk (nil at
+  close).
+  """
+  def raw_input(%__MODULE__{} = ctx, fun) when is_function(fun, 1),
+    do: raw_input(ctx, "raw", fun)
+
+  def raw_input(%__MODULE__{} = ctx, mode, fun) when is_function(fun, 1) do
+    sid = Session.open_raw_input(ctx.session, mode)
+    reader = fn -> normalize_chunk(Session.read_raw(ctx.session, sid)) end
+
+    try do
+      fun.(reader)
+    after
+      Session.close_raw_input(ctx.session, sid)
+    end
+  end
+
+  @doc "Read a single keypress (cbreak: echo + signal keys on). Returns the chunk."
+  def read_key(%__MODULE__{} = ctx, mode \\ "cbreak") do
+    raw_input(ctx, mode, fn read -> read.() end)
+  end
+
+  defp normalize_chunk(%Msgpax.Bin{data: data}), do: data
+  defp normalize_chunk(other), do: other
+
   @doc "End the session with an exit status (defaults to 0)."
   def exit(%__MODULE__{} = ctx, status \\ 0), do: Session.exit(ctx.session, status)
 

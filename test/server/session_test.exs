@@ -65,6 +65,14 @@ defmodule Terminalwire.Server.SessionTest do
 
   defp handle(_session, %{"t" => "welcome"}, state), do: state
 
+  # The server opened a raw-input stream: enter raw mode and stream one keystroke,
+  # like the real client does.
+  defp handle(session, %{"t" => "open", "sid" => sid, "stream" => "stdin-raw"}, state) do
+    key = Keyword.get(state.opts, :key, "x")
+    Session.receive_frame(session, Codec.encode(Frames.data(sid, key)))
+    put_in(state, [:streams, sid], "stdin-raw")
+  end
+
   defp handle(_session, %{"t" => "open", "sid" => sid, "stream" => stream}, state) do
     put_in(state, [:streams, sid], stream)
   end
@@ -78,6 +86,18 @@ defmodule Terminalwire.Server.SessionTest do
   end
 
   defp handle(_session, %{"t" => "close"}, state), do: state
+
+  # Serve the stdin read_chunk pull from opts[:pipe], tracking how much we've fed.
+  defp handle(session, %{"t" => "request", "sid" => sid, "resource" => "stdin", "method" => "read_chunk", "params" => p}, state) do
+    pipe = Keyword.get(state.opts, :pipe, "")
+    pos = Map.get(state, :pipe_pos, 0)
+    take = min(p["n"] || 65_536, byte_size(pipe) - pos)
+    chunk = binary_part(pipe, pos, take)
+    new_pos = pos + take
+    resp = %{"data" => Msgpax.Bin.new(chunk), "eof" => new_pos >= byte_size(pipe)}
+    Session.receive_frame(session, Codec.encode(Frames.response_ok(sid, resp)))
+    Map.put(state, :pipe_pos, new_pos)
+  end
 
   defp handle(session, %{"t" => "request", "sid" => sid, "resource" => res, "method" => meth} = f, state) do
     value =
@@ -216,6 +236,71 @@ defmodule Terminalwire.Server.SessionTest do
     result = run(fn ctx -> Context.puts(ctx, big); 0 end)
     assert result.stdout == big <> "\n"
     assert result.status == 0
+  end
+
+  test "drains piped stdin to EOF, byte-exact" do
+    payload = String.duplicate("abc\n", 1000)
+
+    result =
+      run(
+        fn ctx ->
+          data = Context.read(ctx)
+          Context.puts(ctx, "len=#{byte_size(data)} head=#{String.slice(data, 0, 3)}")
+          0
+        end,
+        pipe: payload
+      )
+
+    assert result.stdout =~ "len=#{byte_size(payload)} head=abc"
+  end
+
+  test "read_chunk returns data and an eof flag" do
+    result =
+      run(
+        fn ctx ->
+          {a, eof} = Context.read_chunk(ctx, 3)
+          Context.puts(ctx, "a=#{a} eof=#{eof}")
+          0
+        end,
+        pipe: "hello"
+      )
+
+    assert result.stdout =~ "a=hel eof=false"
+  end
+
+  test "read_key reads one keystroke from a raw-input stream" do
+    result =
+      run(
+        fn ctx ->
+          key = Context.read_key(ctx)
+          Context.puts(ctx, "KEY #{key}")
+          0
+        end,
+        key: "q"
+      )
+
+    assert result.stdout =~ "KEY q"
+  end
+
+  test "an interrupt signal terminates the handler and exits 130" do
+    test = self()
+
+    {:ok, session} =
+      Session.start_link(
+        handler: fn _ctx -> Process.sleep(:infinity) end,
+        on_send: fn b -> send(test, {:frame, b}) end
+      )
+
+    Session.receive_frame(session, Codec.encode(hello([])))
+    assert_receive {:frame, w}, 1000
+    assert Codec.decode(w)["t"] == "welcome"
+
+    # client sends Ctrl-C
+    Session.receive_frame(session, Codec.encode(Frames.interrupt()))
+    assert_receive {:frame, e}, 1000
+    exit_frame = Codec.decode(e)
+    assert exit_frame["t"] == "exit"
+    assert exit_frame["status"] == 130
   end
 
   test "non-integer handler return becomes exit 0" do

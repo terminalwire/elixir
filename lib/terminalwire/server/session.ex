@@ -72,6 +72,17 @@ defmodule Terminalwire.Server.Session do
   @doc false
   def exit(session, status), do: GenServer.cast(session, {:exit, status})
 
+  # Raw input (REPL/TUI): open a stdin-raw stream in `mode` (raw/cbreak); the
+  # client streams keystrokes as data frames until we close it.
+  @doc false
+  def open_raw_input(session, mode), do: GenServer.call(session, {:open_raw, mode})
+
+  @doc false
+  def read_raw(session, sid), do: GenServer.call(session, {:read_raw, sid}, :infinity)
+
+  @doc false
+  def close_raw_input(session, sid), do: GenServer.call(session, {:close_raw, sid})
+
   # --- GenServer ---
 
   @impl true
@@ -104,7 +115,9 @@ defmodule Terminalwire.Server.Session do
        # the client's advertised initial window (per stream)
        client_window: Protocol.default_window(),
        # the IO device set as the handler's group leader
-       io: nil
+       io: nil,
+       # raw input streams: sid => %{q: :queue of chunks, waiter: from|nil, closed: bool}
+       raw: %{}
      }}
   end
 
@@ -146,11 +159,59 @@ defmodule Terminalwire.Server.Session do
     end
   end
 
+  # Raw input: open a stdin-raw stream the client streams keystrokes on.
+  def handle_call({:open_raw, mode}, _from, state) do
+    {conn, sid, frame} = Connection.open_stream(state.conn, "stdin-raw", mode)
+    state = %{state | conn: conn}
+    send_frame(state, frame)
+    raw = Map.put(state.raw, sid, %{q: :queue.new(), waiter: nil, closed: false})
+    {:reply, sid, %{state | raw: raw}}
+  end
+
+  # Read the next keystroke chunk; blocks (deferred reply) until one arrives, or
+  # returns nil once the stream is closed / unknown.
+  def handle_call({:read_raw, sid}, from, state) do
+    case Map.get(state.raw, sid) do
+      nil ->
+        {:reply, nil, state}
+
+      %{q: q} = rs ->
+        case :queue.out(q) do
+          {{:value, chunk}, rest} ->
+            {:reply, chunk, %{state | raw: Map.put(state.raw, sid, %{rs | q: rest})}}
+
+          {:empty, _} ->
+            if rs.closed,
+              do: {:reply, nil, state},
+              else: {:noreply, %{state | raw: Map.put(state.raw, sid, %{rs | waiter: from})}}
+        end
+    end
+  end
+
+  def handle_call({:close_raw, sid}, _from, state) do
+    case Map.get(state.raw, sid) do
+      nil ->
+        {:reply, :ok, state}
+
+      rs ->
+        send_frame(state, Frames.close(sid))
+        if rs.waiter, do: GenServer.reply(rs.waiter, nil)
+        {:reply, :ok, %{state | raw: Map.delete(state.raw, sid)}}
+    end
+  end
+
   @impl true
   def handle_info({ref, status}, %{handler_task: %Task{ref: ref}} = state) do
     Process.demonitor(ref, [:flush])
     code = if is_integer(status), do: status, else: 0
     send_frame(state, Frames.exit(code))
+    {:stop, :normal, state}
+  end
+
+  # The handler was interrupted (Ctrl-C from the client) — exit 130, like a local
+  # SIGINT, instead of treating it as a crash.
+  def handle_info({:DOWN, _ref, :process, _pid, :tw_interrupt}, state) do
+    send_frame(state, Frames.exit(130))
     {:stop, :normal, state}
   end
 
@@ -210,7 +271,35 @@ defmodule Terminalwire.Server.Session do
     state
   end
 
+  # A keystroke chunk on a raw-input stream: hand it to a blocked reader, or
+  # buffer it until one calls read_raw. Drop chunks for unknown/closed streams.
+  defp apply_directive({:event, :input, payload}, state) do
+    bytes = unwrap_bin(payload.bytes)
+
+    case Map.get(state.raw, payload.sid) do
+      nil ->
+        state
+
+      %{waiter: nil, q: q} = rs ->
+        %{state | raw: Map.put(state.raw, payload.sid, %{rs | q: :queue.in(bytes, q)})}
+
+      %{waiter: from} = rs ->
+        GenServer.reply(from, bytes)
+        %{state | raw: Map.put(state.raw, payload.sid, %{rs | waiter: nil})}
+    end
+  end
+
+  # Ctrl-C: interrupt the handler so the session exits 130 (a local SIGINT).
+  defp apply_directive({:event, :interrupt, _payload}, state) do
+    if state.handler_task, do: Process.exit(state.handler_task.pid, :tw_interrupt)
+    state
+  end
+
   defp apply_directive({:event, _other, _payload}, state), do: state
+
+  defp unwrap_bin(%Msgpax.Bin{data: data}), do: data
+  defp unwrap_bin(bytes) when is_binary(bytes), do: bytes
+  defp unwrap_bin(other), do: to_string(other)
 
   defp reply_response(from, %{ok: true, value: value}), do: GenServer.reply(from, {:ok, value})
 
