@@ -13,13 +13,25 @@ defmodule Terminalwire.Server.Session do
   (the read-pump role), while the CLI handler runs in a separate task and calls
   back in for synchronous requests (stdin, files) — matching the Ruby runtime's
   pump + waiters model.
+
+  Output is **flow-controlled** (the SSH/HTTP-2 window model): each output stream
+  has credit; `emit_output/3` chunks to `@max_frame` and blocks the writer until
+  credit exists, topped up by `window_adjust` frames. Blocking is done by deferring
+  the GenServer reply (we stash `from` and reply once the bytes are sent), so the
+  session itself never blocks and keeps processing inbound frames.
+
+  The handler also gets a `Terminalwire.Server.IO` device set as its group leader,
+  so standard `IO.*` and libraries like Owl flow over the wire (see that module).
   """
 
   use GenServer
   require Logger
 
-  alias Terminalwire.{Codec, Frames}
-  alias Terminalwire.Server.{Connection, Context}
+  alias Terminalwire.{Codec, Frames, Protocol}
+  alias Terminalwire.Server.{Connection, Context, Terminal}
+
+  # Largest payload in a single data frame; the actual size is min(this, credit).
+  @max_frame 32 * 1024
 
   # --- public API ---
 
@@ -50,7 +62,8 @@ defmodule Terminalwire.Server.Session do
     GenServer.call(session, {:request, resource, method, params}, timeout)
   end
 
-  # Called by Context — fire-and-forget output (flow-controlled internally).
+  # Called by Context / the IO device — flow-controlled output. Blocks (via a
+  # deferred reply) until the bytes have been sent within the client's window.
   @doc false
   def emit_output(session, stream, bytes) do
     GenServer.call(session, {:output, stream, bytes}, :infinity)
@@ -84,8 +97,14 @@ defmodule Terminalwire.Server.Session do
        waiters: %{},
        # output stream ids by name, opened lazily
        streams: %{},
-       # flow windows: sid => remaining credit
-       windows: %{}
+       # flow windows: sid => remaining credit (bytes)
+       windows: %{},
+       # output awaiting credit: sid => :queue of {from, bytes}
+       pending: %{},
+       # the client's advertised initial window (per stream)
+       client_window: Protocol.default_window(),
+       # the IO device set as the handler's group leader
+       io: nil
      }}
   end
 
@@ -112,12 +131,19 @@ defmodule Terminalwire.Server.Session do
     {:noreply, %{state | conn: conn, waiters: Map.put(state.waiters, sid, from)}}
   end
 
-  def handle_call({:output, stream, bytes}, _from, state) do
+  def handle_call({:output, stream, bytes}, from, state) do
     {state, sid} = ensure_stream(state, stream)
-    # Chunk to flow credit; here we keep it simple and send whole (window default
-    # is large). A future enhancement blocks on credit like the Ruby runtime.
-    send_frame(state, Frames.data(sid, bytes))
-    {:reply, :ok, state}
+    bytes = IO.iodata_to_binary(bytes)
+
+    if bytes == "" do
+      # A zero-length write is a flush, not flow-controlled — send it and return.
+      send_frame(state, Frames.data(sid, ""))
+      {:reply, :ok, state}
+    else
+      queue = :queue.in({from, bytes}, Map.get(state.pending, sid, :queue.new()))
+      # Don't reply now — drain replies to `from` once its bytes are fully sent.
+      {:noreply, drain(%{state | pending: Map.put(state.pending, sid, queue)}, sid)}
+    end
   end
 
   @impl true
@@ -144,13 +170,21 @@ defmodule Terminalwire.Server.Session do
   end
 
   defp apply_directive({:event, :ready, payload}, state) do
-    # Handshake done — launch the CLI handler with a Context bound to this session.
+    # Handshake done. Seed the IO device with the client's terminal size, set it
+    # as the handler's group leader (so standard IO + Owl route over the wire),
+    # and launch the CLI handler with a Context bound to this session.
+    client_window = get_in(payload, [:flow, "window"]) || Protocol.default_window()
+    t = Terminal.from_map(payload[:terminal])
+    {:ok, io} = Terminalwire.Server.IO.start_link(self(), t.cols, t.rows)
     ctx = Context.new(self(), payload)
 
     task =
-      Task.Supervisor.async_nolink(Terminalwire.TaskSupervisor, fn -> state.handler.(ctx) end)
+      Task.Supervisor.async_nolink(Terminalwire.TaskSupervisor, fn ->
+        Process.group_leader(self(), io)
+        state.handler.(ctx)
+      end)
 
-    %{state | handler_task: task}
+    %{state | handler_task: task, io: io, client_window: client_window}
   end
 
   defp apply_directive({:event, :response, payload}, state) do
@@ -165,9 +199,15 @@ defmodule Terminalwire.Server.Session do
   end
 
   defp apply_directive({:event, :window_adjust, payload}, state) do
-    update_in(state.windows, fn w ->
-      Map.update(w, payload.sid, payload.bytes, &(&1 + payload.bytes))
-    end)
+    windows = Map.update(state.windows, payload.sid, payload.bytes, &(&1 + payload.bytes))
+    drain(%{state | windows: windows}, payload.sid)
+  end
+
+  defp apply_directive({:event, :resize, payload}, state) do
+    # Keep the IO device's geometry live so :io.columns / Owl.IO.columns reflect
+    # the client's current size mid-session.
+    if state.io, do: Terminalwire.Server.IO.resized(state.io, payload.cols, payload.rows)
+    state
   end
 
   defp apply_directive({:event, _other, _payload}, state), do: state
@@ -189,13 +229,58 @@ defmodule Terminalwire.Server.Session do
     case Map.get(state.streams, name) do
       nil ->
         {conn, sid, frame} = Connection.open_stream(state.conn, name)
-        send_frame(%{state | conn: conn}, frame)
-        {%{state | conn: conn, streams: Map.put(state.streams, name, sid)}, sid}
+        state = %{state | conn: conn}
+        send_frame(state, frame)
+
+        state = %{
+          state
+          | streams: Map.put(state.streams, name, sid),
+            windows: Map.put(state.windows, sid, state.client_window)
+        }
+
+        {state, sid}
 
       sid ->
         {state, sid}
     end
   end
+
+  # Send as much queued output for `sid` as current credit allows, chunked to
+  # @max_frame, replying :ok to each writer once all its bytes are out. Runs
+  # inside the GenServer and never blocks: a write that outruns the window stays
+  # queued (its `from` un-replied) until window_adjust frames top the credit up.
+  defp drain(state, sid) do
+    credit = Map.get(state.windows, sid, 0)
+    queue = Map.get(state.pending, sid, :queue.new())
+    {credit, queue} = do_drain(state, sid, credit, queue)
+
+    %{
+      state
+      | windows: Map.put(state.windows, sid, credit),
+        pending: Map.put(state.pending, sid, queue)
+    }
+  end
+
+  defp do_drain(state, sid, credit, queue) when credit > 0 do
+    case :queue.out(queue) do
+      {{:value, {from, bytes}}, rest} ->
+        take = min(min(byte_size(bytes), @max_frame), credit)
+        <<chunk::binary-size(take), remaining::binary>> = bytes
+        send_frame(state, Frames.data(sid, chunk))
+
+        if remaining == "" do
+          GenServer.reply(from, :ok)
+          do_drain(state, sid, credit - take, rest)
+        else
+          do_drain(state, sid, credit - take, :queue.in_r({from, remaining}, rest))
+        end
+
+      {:empty, queue} ->
+        {credit, queue}
+    end
+  end
+
+  defp do_drain(_state, _sid, credit, queue), do: {credit, queue}
 
   defp send_frame(state, frame), do: state.on_send.(Codec.encode(frame))
 

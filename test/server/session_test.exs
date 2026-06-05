@@ -175,6 +175,49 @@ defmodule Terminalwire.Server.SessionTest do
     assert result.stderr == "oops\n"
   end
 
+  # The group-leader redirect: standard IO from the handler (no Context) flows to
+  # the client via the Terminalwire.Server.IO device set as the task's group leader.
+  test "standard IO.puts streams over the wire" do
+    result = run(fn _ctx -> IO.puts("plain IO works"); 0 end)
+    assert result.stdout == "plain IO works\n"
+    assert result.status == 0
+  end
+
+  test "standard IO.gets reads the client's stdin" do
+    result =
+      run(
+        fn _ctx ->
+          name = "name? " |> IO.gets() |> String.trim()
+          IO.puts("hi #{name}")
+          0
+        end,
+        stdin: "Ada\n"
+      )
+
+    assert result.stdout =~ "name? "
+    assert result.stdout =~ "hi Ada"
+  end
+
+  test ":io.columns reports the client's terminal width through the device" do
+    result =
+      run(fn _ctx ->
+        {:ok, cols} = :io.columns()
+        IO.puts("cols=#{cols}")
+        0
+      end)
+
+    assert result.stdout =~ "cols=80"
+  end
+
+  # Flow control: a write larger than the per-frame cap (and the window) is chunked
+  # and paced by the client's window_adjust grants, arriving byte-for-byte intact.
+  test "large output is chunked and flow-controlled, arriving intact" do
+    big = String.duplicate("x", 300_000)
+    result = run(fn ctx -> Context.puts(ctx, big); 0 end)
+    assert result.stdout == big <> "\n"
+    assert result.status == 0
+  end
+
   test "non-integer handler return becomes exit 0" do
     result = run(fn ctx -> Context.puts(ctx, "ok"); :done end)
     assert result.status == 0
