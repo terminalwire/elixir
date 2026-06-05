@@ -3,7 +3,7 @@ defmodule Terminalwire.Negotiator do
   Pure handshake negotiation: given what the client speaks and what the server
   supports, decide the agreed protocol version and capability set. A function,
   not a state machine — identical across languages (conformance/vectors/negotiate).
-  Mirrors `Terminalwire2::Negotiator`.
+  Mirrors `Terminalwire::V2::Negotiator`.
   """
 
   @doc """

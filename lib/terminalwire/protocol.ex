@@ -1,7 +1,7 @@
 defmodule Terminalwire.Protocol do
   @moduledoc """
   Wire-level constants for the Terminalwire v2 protocol. Mirrors the Ruby
-  `Terminalwire2::Protocol` and the language-neutral conformance corpus — see the
+  `Terminalwire::V2::Protocol` and the language-neutral conformance corpus — see the
   protocol spec. These values are part of the cross-language contract; do not
   change them without a corpus vector to match.
   """

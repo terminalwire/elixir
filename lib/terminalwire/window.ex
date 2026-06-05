@@ -1,7 +1,7 @@
 defmodule Terminalwire.Window do
   @moduledoc """
   The flow-control credit rule as a pure ledger — no processes, no I/O. Mirrors
-  Ruby's `Terminalwire2::Window` and the Go `protocol.Window`, and is validated by
+  Ruby's `Terminalwire::V2::Window` and the Go `protocol.Window`, and is validated by
   the shared `flow` conformance corpus. The blocking behaviour when credit runs
   out is an implementation concern layered on top (the Session); this is just the
   protocol arithmetic: how much output may be in flight and how `window_adjust`

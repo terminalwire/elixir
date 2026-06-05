@@ -1,7 +1,7 @@
 defmodule Terminalwire.Frames do
   @moduledoc """
   Builders for each frame type — the wire shape defined in one place. Every
-  builder returns a map with string keys. Mirrors `Terminalwire2::Frames`.
+  builder returns a map with string keys. Mirrors `Terminalwire::V2::Frames`.
   """
 
   alias Terminalwire.Protocol

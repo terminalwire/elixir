@@ -2,7 +2,7 @@ defmodule Terminalwire.Codec do
   @moduledoc """
   Pure bytes <-> frame conversion. A frame is a map with string keys (the wire
   shape). No I/O, no transport — the sans-IO seam the conformance corpus
-  exercises directly. Mirrors `Terminalwire2::Codec`.
+  exercises directly. Mirrors `Terminalwire::V2::Codec`.
 
   Wire format is MessagePack. One subtlety that matters for cross-language
   interop: binary payloads (e.g. `data.bytes`) must be encoded as MessagePack

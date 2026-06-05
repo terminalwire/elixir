@@ -3,7 +3,7 @@ defmodule Terminalwire.Server.Context do
   The server's handle on the client's terminal — the API your CLI code calls.
   Output (`puts`/`print`/`warn`) is fire-and-forget; input and resource ops
   (`gets`, `read_secret`, `file`/`env` reads) are synchronous request/response.
-  Mirrors `Terminalwire2::Server::Context`.
+  Mirrors `Terminalwire::V2::Server::Context`.
 
       def run(ctx) do
         Terminalwire.Server.Context.puts(ctx, "Deploying…")

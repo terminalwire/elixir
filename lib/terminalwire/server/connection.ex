@@ -6,7 +6,7 @@ defmodule Terminalwire.Server.Connection do
     * `{:send, frame}`            — write this frame to the transport
     * {:event, name, payload}`    — a domain event for the application
 
-  No sockets, no processes. Mirrors `Terminalwire2::Server::Connection`. The
+  No sockets, no processes. Mirrors `Terminalwire::V2::Server::Connection`. The
   stateful I/O lives in `Terminalwire.Server.Session`.
   """
 
