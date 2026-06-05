@@ -223,6 +223,26 @@ defmodule Terminalwire.Server.Session do
 
   def handle_info(_msg, state), do: {:noreply, state}
 
+  # The session is going away (socket closed, handler done/crashed). Unblock
+  # everyone parked on a deferred reply so they get a clean answer instead of
+  # crashing on the dead GenServer — mirrors the Ruby runtime's shutdown (fail
+  # in-flight requests, ack pending output, return nil to raw readers). In the
+  # normal-completion path these are all empty, so this only does work on an
+  # abrupt disconnect.
+  @impl true
+  def terminate(_reason, state) do
+    Enum.each(state.waiters, fn {_sid, from} ->
+      GenServer.reply(from, {:error, "io", "connection closed"})
+    end)
+
+    Enum.each(state.pending, fn {_sid, queue} ->
+      Enum.each(:queue.to_list(queue), fn {from, _bytes} -> GenServer.reply(from, :ok) end)
+    end)
+
+    Enum.each(state.raw, fn {_sid, rs} -> rs.waiter && GenServer.reply(rs.waiter, nil) end)
+    :ok
+  end
+
   # --- directive application ---
 
   defp apply_directive({:send, frame}, state) do
@@ -260,8 +280,16 @@ defmodule Terminalwire.Server.Session do
   end
 
   defp apply_directive({:event, :window_adjust, payload}, state) do
-    windows = Map.update(state.windows, payload.sid, payload.bytes, &(&1 + payload.bytes))
-    drain(%{state | windows: windows}, payload.sid)
+    # Only credit a stream we actually opened, with a valid grant — ignore unknown
+    # sids and malformed (non-integer / negative) bytes (mirrors the Ruby flow
+    # controller). Otherwise Map.update would seed a phantom window for an unknown
+    # sid, a negative grant would stall the stream, and a non-integer would crash
+    # the cast handler (it's outside the ProtocolError-only rescue).
+    if Map.has_key?(state.windows, payload.sid) and is_integer(payload.bytes) and payload.bytes >= 0 do
+      drain(update_in(state.windows[payload.sid], &(&1 + payload.bytes)), payload.sid)
+    else
+      state
+    end
   end
 
   defp apply_directive({:event, :resize, payload}, state) do

@@ -359,4 +359,71 @@ defmodule Terminalwire.Server.SessionTest do
       3000 -> flunk("never saw the handler result")
     end
   end
+
+  test "survives malformed window_adjust frames (unknown sid / negative / non-integer)" do
+    test = self()
+
+    {:ok, session} =
+      Session.start_link(
+        handler: fn ctx -> Context.puts(ctx, "alive"); 0 end,
+        on_send: fn b -> send(test, {:frame, b}) end
+      )
+
+    Session.receive_frame(session, Codec.encode(hello([])))
+    # None of these may crash the session or poison a window.
+    Session.receive_frame(session, Codec.encode(Frames.window_adjust(999, 50))) # unknown sid
+    Session.receive_frame(session, Codec.encode(Frames.window_adjust(1, -100))) # negative
+    Session.receive_frame(session, Codec.encode(Frames.window_adjust(1, "lots"))) # non-integer
+
+    assert status_of_exit(session) == 0
+  end
+
+  test "a disconnect unblocks a handler waiting on input with a clean error (no crash)" do
+    test = self()
+
+    {:ok, session} =
+      Session.start_link(
+        handler: fn ctx ->
+          reply =
+            try do
+              Context.gets(ctx)
+              :unexpected
+            rescue
+              e in Terminalwire.ResponseError -> {:closed, e.code}
+            end
+
+          send(test, {:handler_result, reply})
+          0
+        end,
+        on_send: fn b -> send(test, {:frame, b}) end
+      )
+
+    Session.receive_frame(session, Codec.encode(hello([])))
+    wait_for_request(session)
+
+    ref = Process.monitor(session)
+    Session.close(session) # socket closed
+
+    assert_receive {:handler_result, {:closed, "io"}}, 1000
+    assert_receive {:DOWN, ^ref, :process, ^session, :normal}, 1000
+  end
+
+  defp status_of_exit(session) do
+    receive do
+      {:frame, bytes} ->
+        f = Codec.decode(bytes)
+        if f["t"] == "exit", do: f["status"], else: status_of_exit(session)
+    after
+      3000 -> flunk("session never exited")
+    end
+  end
+
+  defp wait_for_request(session) do
+    receive do
+      {:frame, bytes} ->
+        if Codec.decode(bytes)["t"] == "request", do: :ok, else: wait_for_request(session)
+    after
+      2000 -> flunk("handler never made a request")
+    end
+  end
 end
