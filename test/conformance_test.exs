@@ -8,6 +8,10 @@ defmodule Terminalwire.ConformanceTest do
   """
   use ExUnit.Case
 
+  # Tagged so this repo's own fast CI can skip it (no corpus); the protocol
+  # interop matrix sets TERMINALWIRE_CORPUS and runs it. See test_helper.exs.
+  @moduletag :corpus
+
   alias Terminalwire.{Codec, Negotiator, Window}
 
   @corpus System.get_env("TERMINALWIRE_CORPUS") ||

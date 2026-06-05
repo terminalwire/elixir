@@ -1,0 +1,26 @@
+name: Elixir
+
+# Fast per-repo unit tests for the Elixir server. The cross-language conformance
+# vectors (TERMINALWIRE_CORPUS) live in terminalwire/protocol and are excluded
+# here (the :corpus tag, see test/test_helper.exs); the protocol interop matrix
+# runs them. This gates elixir PRs on the server/codec/negotiator/web_sock units.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: "1.17"
+          otp-version: "27"
+      - name: Deps
+        run: mix deps.get
+      - name: Unit tests (corpus excluded without TERMINALWIRE_CORPUS)
+        run: mix test
