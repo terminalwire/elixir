@@ -165,7 +165,7 @@ defmodule Terminalwire.ConformanceTest do
   # at the same points. Only server-role tapes run here (Go is the other role).
   describe "session corpus (server state machine)" do
     test "every server tape plays identically" do
-      vectors = load("session")
+      vectors = load_session()
       assert length(vectors) > 0, "session corpus is empty — wrong corpus path?"
 
       for tape <- vectors, tape["role"] == "server" do
@@ -222,10 +222,33 @@ defmodule Terminalwire.ConformanceTest do
     end
   end
 
+  defp play_tape(conn, [%{"do" => action} = step | rest], name) do
+    {conn, frame} = do_action(conn, action)
+    assert_session_directives([{:send, frame}], step["emit"], name)
+    play_tape(conn, rest, name)
+  end
+
   defp play_tape(conn, [step | rest], name) do
     {conn, directives} = Connection.receive_frame(conn, step["recv"])
     assert_session_directives(directives, step["emit"], name)
     play_tape(conn, rest, name)
+  end
+
+  # Server-initiated actions: invoke the Connection and return {conn, emitted frame}.
+  defp do_action(conn, %{"open_stream" => spec}) do
+    {stream, mode} =
+      case spec do
+        %{"stream" => s} = m -> {s, m["mode"]}
+        s -> {s, nil}
+      end
+
+    {conn, _sid, frame} = Connection.open_stream(conn, stream, mode)
+    {conn, frame}
+  end
+
+  defp do_action(conn, %{"call" => c}) do
+    {conn, _sid, frame} = Connection.call(conn, c["resource"], c["method"], c["params"] || %{})
+    {conn, frame}
   end
 
   defp assert_session_directives(directives, expected, name) do
@@ -271,6 +294,135 @@ defmodule Terminalwire.ConformanceTest do
     do: Enum.all?(exp, fn {k, v} -> Map.has_key?(act, k) and tape_subset?(v, Map.get(act, k)) end)
 
   defp tape_subset?(exp, act), do: exp == act
+
+  # --- session tapes are S-expressions (a tiny reader, shared grammar with Ruby/Go) ---
+
+  defp load_session do
+    Path.wildcard(Path.join([@corpus, "vectors", "session", "*.sexp"]))
+    |> Enum.flat_map(fn path ->
+      path |> File.read!() |> sexp_read_all() |> Enum.map(&sexp_interpret/1)
+    end)
+  end
+
+  defp sexp_interpret([_tape, name, [role | conf] | transcript]) do
+    if role == "client" do
+      # Go runs client tapes; here we only need enough to skip them by role.
+      %{"name" => name, "role" => role}
+    else
+      %{"name" => name, "role" => role, "config" => sexp_map(conf), "tape" => sexp_group(transcript)}
+    end
+  end
+
+  defp sexp_group(forms) do
+    forms
+    |> Enum.reduce([], fn f, acc ->
+      case f do
+        ["recv", frame] -> [%{"recv" => sexp_value(frame), "emit" => []} | acc]
+        ["do", action] -> [%{"do" => sexp_action(action), "emit" => []} | acc]
+        ["send", frame] -> update_last(acc, &Map.update!(&1, "emit", fn e -> e ++ [%{"send" => sexp_value(frame)}] end))
+        ["reject"] -> update_last(acc, &Map.put(&1, "reject", true))
+        ["event", name | data] ->
+          ev = if data == [], do: %{"event" => to_string(name)}, else: %{"event" => to_string(name), "data" => sexp_map(data)}
+          update_last(acc, &Map.update!(&1, "emit", fn e -> e ++ [ev] end))
+      end
+    end)
+    |> Enum.reverse()
+  end
+
+  defp update_last([last | rest], fun), do: [fun.(last) | rest]
+
+  defp sexp_action([head | rest]) do
+    case rest do
+      [v] when not is_tuple(v) and not is_list(v) -> %{head => sexp_value(v)}
+      _ -> %{head => sexp_map(rest)}
+    end
+  end
+
+  # form -> frame/map/list/bytes
+  defp sexp_value(form) when is_list(form) do
+    case form do
+      [] -> []
+      [{:kw, _} | _] -> sexp_map(form)
+      ["bin", b64 | _] -> Base.decode64!(b64)
+      [head | rest] ->
+        if Enum.any?(rest, &match?({:kw, _}, &1)),
+          do: Map.put(sexp_map(rest), "t", head),
+          else: Enum.map(form, &sexp_value/1)
+    end
+  end
+
+  defp sexp_value(other), do: other
+
+  defp sexp_map(pairs) do
+    pairs
+    |> Enum.chunk_every(2)
+    |> Enum.reduce(%{}, fn [{:kw, k}, v], acc -> Map.put(acc, k, sexp_value(v)) end)
+  end
+
+  # reader: text -> forms
+  defp sexp_read_all(text), do: text |> sexp_tokenize([]) |> sexp_read_forms([])
+
+  defp sexp_read_forms([], acc), do: Enum.reverse(acc)
+  defp sexp_read_forms(toks, acc) do
+    {form, rest} = sexp_read_form(toks)
+    sexp_read_forms(rest, [form | acc])
+  end
+
+  defp sexp_read_form([:open | rest]), do: sexp_read_list(rest, [])
+  defp sexp_read_form([{:str, s} | rest]), do: {s, rest}
+  defp sexp_read_form([{:atom, a} | rest]), do: {sexp_atom(a), rest}
+
+  defp sexp_read_list([:close | rest], acc), do: {Enum.reverse(acc), rest}
+  defp sexp_read_list(toks, acc) do
+    {form, rest} = sexp_read_form(toks)
+    sexp_read_list(rest, [form | acc])
+  end
+
+  defp sexp_atom("true"), do: true
+  defp sexp_atom("false"), do: false
+  defp sexp_atom("nil"), do: nil
+  defp sexp_atom(":" <> name), do: {:kw, name}
+  defp sexp_atom(a) do
+    cond do
+      Regex.match?(~r/\A-?\d+\z/, a) -> String.to_integer(a)
+      Regex.match?(~r/\A-?\d+\.\d+\z/, a) -> String.to_float(a)
+      true -> a
+    end
+  end
+
+  defp sexp_tokenize(<<>>, acc), do: Enum.reverse(acc)
+  defp sexp_tokenize(<<";", rest::binary>>, acc), do: sexp_tokenize(sexp_skip_line(rest), acc)
+  defp sexp_tokenize(<<c, rest::binary>>, acc) when c in [?\s, ?\t, ?\r, ?\n], do: sexp_tokenize(rest, acc)
+  defp sexp_tokenize(<<"(", rest::binary>>, acc), do: sexp_tokenize(rest, [:open | acc])
+  defp sexp_tokenize(<<")", rest::binary>>, acc), do: sexp_tokenize(rest, [:close | acc])
+  defp sexp_tokenize(<<"\"", rest::binary>>, acc) do
+    {s, rest2} = sexp_read_string(rest, <<>>)
+    sexp_tokenize(rest2, [{:str, s} | acc])
+  end
+  defp sexp_tokenize(text, acc) do
+    {a, rest} = sexp_read_atom(text, <<>>)
+    sexp_tokenize(rest, [{:atom, a} | acc])
+  end
+
+  defp sexp_skip_line(<<>>), do: <<>>
+  defp sexp_skip_line(<<"\n", rest::binary>>), do: rest
+  defp sexp_skip_line(<<_, rest::binary>>), do: sexp_skip_line(rest)
+
+  defp sexp_read_string(<<"\"", rest::binary>>, acc), do: {acc, rest}
+  defp sexp_read_string(<<"\\", c, rest::binary>>, acc) do
+    ch = case c do
+      ?n -> "\n"
+      ?t -> "\t"
+      ?r -> "\r"
+      _ -> <<c>>
+    end
+    sexp_read_string(rest, acc <> ch)
+  end
+  defp sexp_read_string(<<c, rest::binary>>, acc), do: sexp_read_string(rest, acc <> <<c>>)
+
+  defp sexp_read_atom(<<c, _::binary>> = text, acc) when c in [?(, ?), ?\s, ?\t, ?\r, ?\n, ?;, ?"], do: {acc, text}
+  defp sexp_read_atom(<<>>, acc), do: {acc, <<>>}
+  defp sexp_read_atom(<<c, rest::binary>>, acc), do: sexp_read_atom(rest, acc <> <<c>>)
 
   # Msgpax decodes `bin` to a plain binary; the corpus represents binary as
   # {"$bin" => base64}. Resolve those so comparisons line up.
