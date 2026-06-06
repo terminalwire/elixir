@@ -13,6 +13,7 @@ defmodule Terminalwire.ConformanceTest do
   @moduletag :corpus
 
   alias Terminalwire.{Codec, Negotiator, Window}
+  alias Terminalwire.Server.Connection
 
   @corpus System.get_env("TERMINALWIRE_CORPUS") ||
             Path.expand("../../../conformance", __DIR__)
@@ -21,7 +22,7 @@ defmodule Terminalwire.ConformanceTest do
   # if this list ever drifts from what the corpus actually contains OR from what
   # this suite exercises — so an implementation can't silently skip a category
   # (which is exactly how this suite previously ran only 3 of 5).
-  @covered_categories ~w(negotiate roundtrip golden validate flow)
+  @covered_categories ~w(negotiate roundtrip golden validate flow session)
 
   defp load(category) do
     Path.wildcard(Path.join([@corpus, "vectors", category, "*.yml"]))
@@ -158,6 +159,30 @@ defmodule Terminalwire.ConformanceTest do
     end
   end
 
+  # Session tapes: recorded client<->server interactions replayed through the SERVER
+  # state machine (Connection). The Ruby runner drives the SAME tapes, pinning the
+  # two server Connections to emit identical directives and reject the same frames
+  # at the same points. Only server-role tapes run here (Go is the other role).
+  describe "session corpus (server state machine)" do
+    test "every server tape plays identically" do
+      vectors = load("session")
+      assert length(vectors) > 0, "session corpus is empty — wrong corpus path?"
+
+      for tape <- vectors, tape["role"] == "server" do
+        cfg = tape["config"]
+
+        conn =
+          Connection.new(
+            server_min: cfg["min"],
+            server_max: cfg["max"],
+            server_capabilities: cfg["capabilities"]
+          )
+
+        play_tape(conn, tape["tape"], tape["name"])
+      end
+    end
+  end
+
   # Completeness gate: assert this suite exercises EVERY category the corpus
   # ships — no silent drift. If the corpus gains a category, this fails until the
   # implementation adds a runner for it.
@@ -181,6 +206,71 @@ defmodule Terminalwire.ConformanceTest do
              "categories claimed-covered but absent from corpus: #{inspect(MapSet.to_list(stale))}"
     end
   end
+
+  # --- session tape playback ---
+
+  defp play_tape(_conn, [], _name), do: :ok
+
+  defp play_tape(conn, [%{"reject" => true} = step | _rest], name) do
+    frame = step["recv"]
+
+    try do
+      Connection.receive_frame(conn, frame)
+      flunk("session/#{name}: expected the server to REJECT #{inspect(frame["t"])}, but it did not")
+    rescue
+      Terminalwire.ProtocolError -> :ok
+    end
+  end
+
+  defp play_tape(conn, [step | rest], name) do
+    {conn, directives} = Connection.receive_frame(conn, step["recv"])
+    assert_session_directives(directives, step["emit"], name)
+    play_tape(conn, rest, name)
+  end
+
+  defp assert_session_directives(directives, expected, name) do
+    assert length(directives) == length(expected),
+           "session/#{name}: expected #{length(expected)} directive(s), got #{inspect(directives)}"
+
+    directives
+    |> Enum.zip(expected)
+    |> Enum.each(fn {actual, exp} -> assert_session_directive(actual, exp, name) end)
+  end
+
+  defp assert_session_directive({:send, frame}, %{"send" => want}, name) do
+    assert tape_subset?(tape_stringify(want), tape_stringify(frame)),
+           "session/#{name}: send #{inspect(frame)} does not contain #{inspect(want)}"
+  end
+
+  defp assert_session_directive({:event, evname, payload}, %{"event" => want} = exp, name) do
+    assert to_string(evname) == want, "session/#{name}: event #{evname} != #{want}"
+
+    case exp do
+      %{"data" => data} ->
+        assert tape_subset?(tape_stringify(data), tape_stringify(payload)),
+               "session/#{name}: event payload #{inspect(payload)} missing #{inspect(data)}"
+
+      _ ->
+        :ok
+    end
+  end
+
+  defp assert_session_directive(actual, exp, name) do
+    flunk("session/#{name}: directive #{inspect(actual)} does not match #{inspect(exp)}")
+  end
+
+  # Deep-convert atom/string keys to strings so impl payloads compare against the
+  # corpus's string keys; match a corpus map as a SUBSET of the actual.
+  defp tape_stringify(m) when is_map(m) and not is_struct(m),
+    do: Map.new(m, fn {k, v} -> {to_string(k), tape_stringify(v)} end)
+
+  defp tape_stringify(l) when is_list(l), do: Enum.map(l, &tape_stringify/1)
+  defp tape_stringify(other), do: other
+
+  defp tape_subset?(exp, act) when is_map(exp) and is_map(act),
+    do: Enum.all?(exp, fn {k, v} -> Map.has_key?(act, k) and tape_subset?(v, Map.get(act, k)) end)
+
+  defp tape_subset?(exp, act), do: exp == act
 
   # Msgpax decodes `bin` to a plain binary; the corpus represents binary as
   # {"$bin" => base64}. Resolve those so comparisons line up.
