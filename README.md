@@ -168,13 +168,13 @@ printf '#!/usr/bin/env terminalwire-exec\nurl: "ws://localhost:8081/terminal"\n'
 
 | layer | module |
 |-------|--------|
-| sans-IO protocol core | `Terminalwire.Protocol`, `Codec`, `Negotiator`, `Frames` |
+| sans-IO protocol core | `Terminalwire.Protocol`, `Terminalwire.Codec`, `Terminalwire.Negotiator`, `Terminalwire.Frames` |
 | sans-IO server state machine | `Terminalwire.Server.Connection` |
 | process that drives it | `Terminalwire.Server.Session` |
 | CLI-facing API | `Terminalwire.Server.Context` |
 | WebSocket adapter | `Terminalwire.WebSock` |
 
-The protocol core mirrors the Ruby server (`terminalwire2`) and the Go client,
+The protocol core mirrors the Ruby Terminalwire server and the Go client,
 and is validated against the **same language-neutral conformance corpus** in
 `terminalwire/protocol` — run `mix test` with `TERMINALWIRE_CORPUS` pointed at it.
 That corpus is the cross-implementation contract: pass it and this server
