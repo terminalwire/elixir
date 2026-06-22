@@ -32,7 +32,9 @@ defmodule Terminalwire.Codec do
   @doc """
   Decode MessagePack bytes for exactly one frame. Returns the frame map (string
   keys). Raises `ProtocolError` for anything that isn't a well-formed frame.
-  `bin` values come back as plain binaries (unpack with binary: true).
+  `bin` values come back wrapped in `Msgpax.Bin` (binary: true) so a decode then
+  re-encode preserves the MessagePack `bin` type instead of degrading to `str`;
+  consumers unwrap them before use (see `Terminalwire.Server.Session`).
   """
   def decode(bytes) when is_binary(bytes) do
     frame =
