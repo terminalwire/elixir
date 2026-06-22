@@ -23,8 +23,12 @@ Go client and the Ruby server.
   `Ctrl-C` → server-side interrupt (exit 130), stdin piping (`Context.read`/
   `read_chunk`), raw input / single-key for REPL/TUI, terminal query, and
   files / dirs / env / browser behind the client-enforced entitlement policy.
-- **Build-your-CLI docs** — Context API reference plus three parsing styles
-  (raw/`OptionParser`, Optimus, Owl) and the two output rules.
+- **`Terminalwire.CLI`** — a Thor-style command router: public functions become
+  commands, their parameters become arguments, and `@desc` becomes generated help,
+  with terminal helpers (`puts`/`gets`/`warn`/`env`/…) bound to the session. Sugar
+  over a plain `run/1` handler, which you can still use directly with any parser.
+- **Build-your-CLI docs** — `Terminalwire.CLI` plus the lower-level handler with
+  three parsing styles (raw/`OptionParser`, Optimus, Owl) and the two output rules.
 - **Runnable examples** — `examples/self_describing.exs` and `examples/owl_cli.exs`.
 - **Coverage floor** — `mix test --cover` gates the build at 85%.
 

@@ -3,10 +3,14 @@
 **Ship a CLI for your web app. No API required.**
 
 Terminalwire streams a command-line app straight from your Phoenix/Plug server to
-your users' machines over a single WebSocket. Instead of building an API,
-generating an SDK, and shipping a separate client, you write your CLI *in your
-app* — calling your contexts, Ecto, and business logic directly — and it runs on
-the user's workstation with their terminal, files, and browser.
+your users' machines over a single WebSocket. You write your CLI *in your app* —
+calling your contexts, Ecto, and business logic directly — and it runs on the
+user's workstation with their terminal, files, and browser.
+
+A CLI usually costs you three things to build: a **REST API** to back it, an **SDK
+or client binary** to ship, and a **release-and-auto-update pipeline** to keep that
+client current. Terminalwire is all three. Users install one small, self-updating
+client with a single `curl … | bash`; you ship features by deploying your server.
 
 ```
  Terminalwire client ⇄ WebSocket endpoint ⇄ Terminalwire.WebSock
@@ -18,6 +22,10 @@ the user's workstation with their terminal, files, and browser.
 
 - **No API to build or version.** Your CLI calls your app's code directly — no
   serializers, no SDK, no client/server version skew.
+- **Nothing to distribute or update.** Users install one small client
+  (`curl <app>.terminalwire.sh | bash`) that self-updates through a signed channel.
+  You ship a change by deploying your server — no per-release client build, no
+  app-store round trip.
 - **It feels local.** Output streams in real time, prompts and passwords work,
   it's color/TTY-aware, resizes with the window, `Ctrl-C` interrupts the
   server-side command, and you can pipe into it (`cat data.csv | your-app import`).
@@ -42,43 +50,63 @@ end
 
 ## Use
 
-Write a handler that takes a `Terminalwire.Server.Context` — this is where you
-parse args (with any CLI library) and talk to the user's terminal:
+Define your CLI as a module. Public functions are commands, their parameters are
+the command's arguments, and `@desc` is the help text — like Ruby's Thor:
 
 ```elixir
-defmodule MyCLI do
-  alias Terminalwire.Server.Context
+defmodule MyApp.CLI do
+  use Terminalwire.CLI, name: "my-app"
 
-  def run(ctx) do
-    case Context.args(ctx) do
-      ["deploy" | _] ->
-        env = Context.gets(ctx, "Environment? ") |> String.trim()
-        Context.puts(ctx, "Deploying to #{env}…")
-        0
+  @desc "Greet someone by name"
+  def hello(name) do
+    puts("Hello, #{name}!")
+  end
 
-      _ ->
-        Context.warn(ctx, "unknown command")
-        1
+  @desc "Deploy to an environment"
+  def deploy(env) do
+    if String.trim(gets("Deploy to #{env}? [y/N] ")) == "y" do
+      puts("Deploying #{env}…")          # call your app's code right here
+    else
+      puts("Aborted")
     end
   end
 end
 ```
 
-Upgrade your WebSocket route to the ready-made adapter:
+Mount it on a WebSocket route — `use` generated `run/1` for you:
 
 ```elixir
 # Plug / Bandit / Cowboy
-WebSockAdapter.upgrade(conn, Terminalwire.WebSock, [handler: &MyCLI.run/1], [])
+WebSockAdapter.upgrade(conn, Terminalwire.WebSock, [handler: &MyApp.CLI.run/1], [])
 ```
 
-## Building your CLI
+That's a working CLI: `my-app hello Ada` runs `hello("Ada")`, `my-app deploy staging`
+runs `deploy("staging")`, and `my-app` (or `my-app help`) prints a generated command
+list. Inside a command, `puts`/`print`/`warn`/`gets`/`read_secret`/`env` talk to the
+user's terminal; `context/0` reaches files, the browser, and the rest.
 
-Your handler `&MyModule.run/1` is called with a `Terminalwire.Server.Context` once
-the handshake completes, in its own BEAM task whose **group leader** is a
-Terminalwire IO device. So plain `IO.puts`/`IO.gets`, `IO.ANSI`, and any library
-that writes to standard IO (like [Owl](https://hexdocs.pm/owl)) stream to the user's
-terminal with **no wiring**. The `Context` covers everything that *isn't* standard
-IO: args, prompts, the client's terminal, files, env, the browser.
+Want flags, options, or your own parsing? `Terminalwire.CLI` is a thin layer over a
+plain `run/1` handler — drop down to it and use any parser. That's the next section.
+
+## The handler API
+
+`Terminalwire.CLI` is a thin layer over a plain handler: a one-argument function
+that takes a `Terminalwire.Server.Context`. Use it directly when you want full
+control over parsing. It's called once the handshake completes, in its own BEAM task
+whose **group leader** is a Terminalwire IO device, so plain `IO.puts`/`IO.gets`,
+`IO.ANSI`, and any library that writes to standard IO (like
+[Owl](https://hexdocs.pm/owl)) stream straight to the user's terminal. The `Context`
+covers everything that *isn't* standard IO: args, prompts, the client's terminal,
+files, env, the browser.
+
+```elixir
+def run(ctx) do
+  case Context.args(ctx) do
+    ["deploy", env] -> deploy(ctx, env)
+    _ -> Context.warn(ctx, "unknown command"); 1
+  end
+end
+```
 
 ### The Context API
 
@@ -172,6 +200,7 @@ printf '#!/usr/bin/env terminalwire-exec\nurl: "ws://localhost:8081/terminal"\n'
 | sans-IO server state machine | `Terminalwire.Server.Connection` |
 | process that drives it | `Terminalwire.Server.Session` |
 | CLI-facing API | `Terminalwire.Server.Context` |
+| command router (Thor-style) | `Terminalwire.CLI` |
 | WebSocket adapter | `Terminalwire.WebSock` |
 
 The protocol core mirrors the Ruby Terminalwire server and the Go client,
